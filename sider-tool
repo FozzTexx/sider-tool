@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+# -*- python -*-
+#
+# Copyright 2019 by Chris Osborn <fozztexx@fozztexx.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License at <http://www.gnu.org/licenses/> for
+# more details.
+
+import argparse
+import struct
+import os
+
+def build_argparser():
+  parser = argparse.ArgumentParser()
+  parser.add_argument("image", help="disk image from sider")
+  parser.add_argument("--extract", nargs="?", const=False,
+                      help="extract a disk partition/volume")
+  parser.add_argument("--update",
+                      help="update a disk partition/volume with specified disk image")
+  parser.add_argument("--volume", help="ID of partition/volume to work with")
+  return parser
+
+class Sider:
+  def __init__(self, path):
+    self.path = path
+    self.blocksize = 512
+    blk1 = self.readBlock(0)
+    blk2 = self.readBlock(1)
+    if len(blk2) == 0 or (sum(blk1[256:]) != 0 and sum(blk2[256:]) != 0):
+      self.blocksize = 256
+    self.parmBlock = Sider.ParameterBlock(self.readBlock(1)[:256])
+    return
+
+  def readBlock(self, offset):
+    f = open(self.path, "rb")
+    f.seek(offset * self.blocksize)
+    blk = f.read(self.blocksize)
+    f.close()
+    return blk
+
+  def writeBlock(self, offset, block):
+    f = open(self.path, "rb+")
+    f.seek(offset * self.blocksize)
+    f.write(block)
+    f.close()
+    return
+  
+  def partitionInfo(self, vos, vnum):
+    if vos == "prodos":
+      if vnum < 0 or vnum > 1:
+        print("Invalid ProDOS volume ID. Must be 0 or 1")
+      offset = self.parmBlock.prodosOffset(vnum)
+      length = self.parmBlock.prodosLength(vnum)
+    elif vos == "dos":
+      offset = self.parmBlock.dosOffset(vnum)
+      length = self.parmBlock.dosLength(vnum)
+    return offset, length
+  
+  def getVolume(self, vid):
+    vparms = vid.split(":")
+    if len(vparms) != 2:
+      print("Invalid volume ID. Volume ID should be ostype:pnum")
+      return None
+
+    vos = vparms[0].lower()
+    vnum = int(vparms[1])
+    offset, length = self.partitionInfo(vos, vnum)
+
+    vol = []
+    offset = int(offset / 256)
+    length = int(length / 256)
+    for idx in range(length):
+      blk = self.readBlock(offset + idx)
+      blk = blk[:256]
+      vol.extend(blk)
+    return vol
+
+  def updateVolume(self, vid, vol):
+    vparms = vid.split(":")
+    if len(vparms) != 2:
+      print("Invalid volume ID. Volume ID should be ostype:pnum")
+      return False
+    vos = vparms[0].lower()
+    vnum = int(vparms[1])
+    offset, length = self.partitionInfo(vos, vnum)
+    offset = int(offset / 256)
+    length = int(length / 256)
+    for idx in range(length):
+      self.writeBlock(offset + idx, vol[idx * 256:(idx + 1) * 256])
+    return True
+  
+  class ParameterBlock:
+    sformat = "< BBB 1s B 19s BHBHHBB 7s 5sH6sH 5sH6sH BB 7s BHH 15s 8s8s8s 6s" \
+        " 5sH6sH 5sH6sH BB 1s HHBHHBBHH 77s B"
+    keys = ["dosSmallVolumes", "smallVolumesXor", "interleave", "reserved", "dosVolumes",
+                 "reserved2", "xor3233", "cylinders", "heads", "reducedWriteCylinders",
+                 "precompCylinders", "maxECCDataBurst", "controlByte", "reserved3", "cpmA",
+                 "cpmAsize", "cpmA2", "cpmAstart", "cpmB", "cpmBsize", "cpmB2", "cpmBstart",
+                 "cpmVol1online", "cpmVol2online", "reserved7", "pascalUnit1", "pascal1Start",
+                 "pascal2Start", "reserved8", "installDate", "modifiedDate", "lastBackupDate",
+                 "reserved9", "cpmC", "cpmCsize", "cpmC2", "cpmCstart", "cpmD", "cpmDsize",
+                 "cpmD2", "cpmDstart", "cpmVol3online", "cpmVol4online", "reserved13",
+                 "prodos1Start", "prodos1Size", "prodosVol1Status", "prodos2Start",
+                 "prodos2Size", "prodosVol2Status", "pascalUnit2", "pascal3Start",
+                 "pascal4Start", "reserved16", "altTracksAvail"]
+    def __init__(self, block):
+      self.block = block
+      values = struct.unpack(self.sformat, self.block)
+      self.dict = dict(zip(self.keys, values))
+      return
+
+    def printBlock(self):
+      for key in self.keys:
+        if not key.startswith("reserved"):
+          print(key, self.dict[key])
+      return
+        
+    def prodosOffset(self, vnum):
+      if vnum == 0:
+        pos = self.dict['prodos1Start']
+      else:
+        pos = self.dict['prodos2Start']
+      return pos * 32 * 256
+
+    def prodosLength(self, vnum):
+      if vnum == 0:
+        pos = self.dict['prodos1Size']
+      else:
+        pos = self.dict['prodos2Size']
+      return pos * 256
+
+    def dosOffset(self, vnum):
+      sv = self.dict['dosSmallVolumes']
+      tv = self.dict['dosVolumes']
+      if vnum < 0 or vnum >= tv:
+        print("Invalid DOS id. Must be from 0 to %i" % (tv - 1))
+        return None
+      offset = 1024 * 256
+      snum = vnum
+      if snum >= sv:
+        snum = sv
+      offset += snum * 140 * 1024
+      if vnum >= sv:
+        offset += (vnum - sv) * 400 * 1024
+      return offset
+
+    def dosLength(self, vnum):
+      sv = self.dict['dosSmallVolumes']
+      tv = self.dict['dosVolumes']
+      if vnum < 0 or vnum >= tv:
+        print("Invalid DOS id. Must be from 0 to %i" % (tv - 1))
+        return None
+      if vnum < sv:
+        return 140 * 1024
+      return 400 * 1024
+    
+def main():
+  args = build_argparser().parse_args()
+
+  image = Sider(args.image)
+  if args.extract != None:
+    vol = image.getVolume(args.volume)
+    if args.extract:
+      path = args.extract
+    else:
+      path, ext = os.path.splitext(args.image)
+      path += "-" + args.volume.replace(":", "-") + ext
+    f = open(path, "wb")
+    f.write(bytes(vol))
+    f.close()
+    print("Wrote %i bytes to %s" % (len(vol), path))
+  elif args.update != None:
+    with open(args.update, mode='rb') as f:
+      vol = f.read()
+    image.updateVolume(args.volume, vol)
+    print("Updated %s" % args.volume)
+  else:
+    print(image.parmBlock.printBlock())
+  return
+
+if __name__ == '__main__':
+  exit(main() or 0)
