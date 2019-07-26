@@ -5,7 +5,7 @@ struct siderParms {
   uint8 reserved[1]; /* 3 */
   uint8 dosVolumes; /* 4 */
   uint8 reserved2[19];
-  uint8 xor3233; /* 24 xor 0xA5 */
+  uint8 xor3233; /* 24 0x18 xor 0xA5 */
   uint16 cylinders; /* 25-26 0x19-0x1A Big endian */
   uint8 heads; /* 27 0x1B */
   uint16 reducedWriteCylinders; /* 28-29 0x1C-01D Big endian */
