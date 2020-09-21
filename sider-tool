@@ -16,14 +16,18 @@
 
 import argparse
 import struct
-import os
+import os, sys
 import tempfile
 import shutil
+import math
 
 TRACKBYTES = 32 * 256
 SDOSBYTES = 140 * 1024
 LDOSBYTES = 400 * 1024
 
+def auto_int(x):
+  return int(x, 0)
+            
 def build_argparser():
   parser = argparse.ArgumentParser()
   parser.add_argument("image", help="disk image from sider")
@@ -33,13 +37,17 @@ def build_argparser():
                       help="update a disk partition/volume with specified disk image")
   parser.add_argument("--resize", type=int,
                       help="resize a disk partition/volume to the specified byte size")
+  parser.add_argument("--move", type=auto_int,
+                      help="move a disk partition/volume to the specified offset")
   parser.add_argument("--volume", help="ID of partition/volume to work with")
   parser.add_argument("--printblock", action="store_true", help="print sider parameter block")
+  parser.add_argument("--bytes", action="store_true", help="print sizes in actual bytes")
   return parser
 
 def sizeof_fmt(num, suffix='B'):
   for unit in ['','k','M','G','T','P','E','Z']:
     if abs(num) < 1024.0:
+      num = math.ceil(num * 10) / 10
       return "%3.1f%s%s" % (num, unit, suffix)
     num /= 1024.0
   return "%.1f%s%s" % (num, 'Yi', suffix)
@@ -56,93 +64,113 @@ class Sider:
     return
 
   def readBlock(self, offset):
-    f = open(self.path, "rb")
-    f.seek(offset * self.blocksize)
-    blk = f.read(self.blocksize)
-    f.close()
+    with open(self.path, "rb") as f:
+      f.seek(offset * self.blocksize)
+      blk = f.read(self.blocksize)
     return blk
 
   def writeBlock(self, offset, block):
-    f = open(self.path, "rb+")
-    f.seek(offset * self.blocksize)
-    f.write(block)
-    f.close()
+    with open(self.path, "rb+") as f:
+      f.seek(offset * self.blocksize)
+      f.write(block)
     return
-  
-  def partitionInfo(self, vos, vnum):
+
+  def validVolumeID(self, vos, vnum):
     if vos == "prodos":
       if vnum < 0 or vnum > 1:
-        print("Invalid ProDOS volume ID. Must be 0 or 1")
-        exit(1)
+        print("Invalid ProDOS volume ID. Must be 0 or 1", file=sys.stderr)
+        return False
       offset = self.parmBlock.prodosOffset(vnum)
       length = self.parmBlock.prodosLength(vnum)
     elif vos == "dos":
       maxv = self.dict['dosVolumes']
       if vnum < 0 or vnum > maxv:
-        print("Invalid DOS volume ID. Must be 0-%i" % (maxv))
-        exit(1)
+        print("Invalid DOS volume ID. Must be 0-%i" % (maxv), file=sys.stderr)
+        return False
       offset = self.parmBlock.dosOffset(vnum)
       length = self.parmBlock.dosLength(vnum)
     elif vos == "pascal":
       if vnum < 0 or vnum > 3:
-        print("Invalid Pascal volume ID. Must be 0-3")
-        exit(1)
+        print("Invalid Pascal volume ID. Must be 0-3", file=sys.stderr)
+        return False
       offset = self.parmBlock.pascalOffset(vnum)
       length = self.parmBlock.pascalLength(vnum)
     elif vos == "cpm":
       if vnum < 0 or vnum > 3:
-        print("Invalid CP/M volume ID. Must be 0-3")
-        exit(1)
+        print("Invalid CP/M volume ID. Must be 0-3", file=sys.stderr)
+        return False
+    else:
+      print("Unknown partition", file=sys.stderr)
+      return False
+    return True
+    
+  def partitionInfo(self, vos, vnum):
+    if not self.validVolumeID(vos, vnum):
+      return None
+    if vos == "prodos":
+      offset = self.parmBlock.prodosOffset(vnum)
+      length = self.parmBlock.prodosLength(vnum)
+    elif vos == "dos":
+      offset = self.parmBlock.dosOffset(vnum)
+      length = self.parmBlock.dosLength(vnum)
+    elif vos == "pascal":
+      offset = self.parmBlock.pascalOffset(vnum)
+      length = self.parmBlock.pascalLength(vnum)
+    elif vos == "cpm":
       offset = self.parmBlock.cpmOffset(vnum)
       length = self.parmBlock.cpmLength(vnum)
-    else:
-      print("Unknown partition")
-      return None
     return offset, length
-  
+
   def getVolume(self, vid):
     vparms = vid.split(":")
     if len(vparms) != 2:
-      print("Invalid volume ID. Volume ID should be ostype:pnum")
-      print("Valid ostypes are: prodos dos pascal cpm")
+      print("Invalid volume ID. Volume ID should be ostype:pnum", file=sys.stderr)
+      print("Valid ostypes are: prodos dos pascal cpm", file=sys.stderr)
       return None
 
     vos = vparms[0].lower()
     vnum = int(vparms[1])
     offset, length = self.partitionInfo(vos, vnum)
 
-    vol = []
+    vol = bytearray()
     offset = int(offset / 256)
     length = int(length / 256)
-    for idx in range(length):
-      blk = self.readBlock(offset + idx)
-      blk = blk[:256]
-      vol.extend(blk)
+    with open(self.path, "rb") as f:
+      f.seek(offset * self.blocksize)
+      for idx in range(length):
+        blk = f.read(self.blocksize)
+        blk = blk[:256]
+        vol.extend(blk)
     return vol
 
-  def updateVolume(self, vid, vol):
-    vparms = vid.split(":")
+  def updateVolume(self, volid, data):
+    vparms = volid.split(":")
     if len(vparms) != 2:
-      print("Invalid volume ID. Volume ID should be ostype:pnum")
+      print("Invalid volume ID. Volume ID should be ostype:pnum", file=sys.stderr)
       return False
     vos = vparms[0].lower()
     vnum = int(vparms[1])
     offset, length = self.partitionInfo(vos, vnum)
     offset = int(offset / 256)
     length = int(length / 256)
+    sector = bytearray(self.blocksize)
+    new_vol = bytearray(0)
     for idx in range(length):
-      block = vol[idx * 256:(idx + 1) * 256]
-      self.writeBlock(offset + idx, block)
+      sector[0:256] = data[idx * 256:(idx + 1) * 256]
+      new_vol.extend(sector)
+    with open(self.path, "rb+") as f:
+      f.seek(offset * self.blocksize)
+      f.write(new_vol)
     return True
 
-  def resizeVolume(self, vid, size):
-    vparms = vid.split(":")
+  def resizeVolume(self, volid, size):
+    vparms = volid.split(":")
     if len(vparms) != 2:
-      print("Invalid volume ID. Volume ID should be ostype:pnum")
+      print("Invalid volume ID. Volume ID should be ostype:pnum", file=sys.stderr)
       return False
     vos = vparms[0].lower()
     if vos == "dos":
-      print("Cannot resize DOS partitions")
+      print("Cannot resize DOS partitions", file=sys.stderr)
       return False
     vnum = int(vparms[1])
     offset, length = self.partitionInfo(vos, vnum)
@@ -152,6 +180,9 @@ class Sider:
     # partitions are aligned on tracks
     newLength = int((size + TRACKBYTES - 1) / TRACKBYTES) * TRACKBYTES
     newLength = int(newLength / 256)
+    # FIXME - maximum SASI drive size is 128MB. Complain if resize
+    #         will make Sider image too big
+    
     tempfd, temppath = tempfile.mkstemp(dir=os.path.dirname(self.path))
     os.close(tempfd)
     cmd = "dd if=\"%s\" of=\"%s\" bs=%i count=%i" \
@@ -168,7 +199,7 @@ class Sider:
     os.system(cmd)
     ptable = self.parmBlock.partitionTable()
     # Set actual length to multiple of sector
-    ptable[vid]['length'] = int((size + 255) / 256) * 256
+    ptable[volid]['length'] = int((size + 255) / 256) * 256
     self.parmBlock.printDict(ptable)
     for key in ptable:
       part = ptable[key]
@@ -182,7 +213,93 @@ class Sider:
     self.parmBlock.packBlock()
     self.writeBlock(1, self.parmBlock.block)
     return
-  
+
+  def moveVolume(self, volid, newOffset):
+    vparms = volid.split(":")
+    if len(vparms) != 2:
+      print("Invalid volume ID. Volume ID should be ostype:pnum", file=sys.stderr)
+      return False
+    vos = vparms[0].lower()
+    if vos == "dos":
+      print("Cannot move DOS partitions", file=sys.stderr)
+      return False
+    vnum = int(vparms[1])
+
+    offset, length = self.partitionInfo(vos, vnum)
+
+    ptable = self.parmBlock.partitionTable()
+    ltable = [[x, ptable[x]['offset']] for x in ptable]
+    ltable.sort(key=lambda x: x[1])
+    for idx in range(len(ltable) - 1):
+      ltable[idx].append(ltable[idx+1][1] - ltable[idx][1])
+    ltable[-1].append(ptable[ltable[-1][0]]['length'])
+    for row in ltable:
+      ptable[row[0]]['size'] = row[2]
+    print(ptable)
+
+    size = ptable["%s:%i" % (vos, vnum)]['size']
+    found = False
+    for key in ptable:
+      part = ptable[key]
+      if part['offset'] == newOffset \
+         or part['offset'] + part['size'] == newOffset + size:
+        found = True
+        break
+    if not found:
+      print("New offset for volume must land on a partition boundary", file=sys.stderr)
+      return False
+
+    # 
+    begin = min(offset, newOffset)
+    end = max(offset + size, newOffset + size)
+    middle = offset
+    if begin == offset:
+      middle += size
+    distance = size
+    if middle == offset + size:
+      distance *= -1
+    print("MOVE",
+          "\n current:", hex(offset), hex(size), offset, size,
+          "\n     new:", hex(newOffset), newOffset,
+          "\n   begin:", hex(begin), begin,
+          "\n  middle:", hex(middle), middle,
+          "\n     end:", hex(end), end,
+          "\ndistance:", hex(abs(distance)), distance)
+      
+    tempfd, temppath = tempfile.mkstemp(dir=os.path.dirname(self.path))
+    os.close(tempfd)
+    cmd = "dd bs=%i count=%i if=\"%s\" of=\"%s\"" \
+        % (self.blocksize, int(begin / 256), self.path, temppath)
+    print(cmd)
+    os.system(cmd)
+    cmd = "dd oflag=append conv=notrunc bs=%i skip=%i count=%i if=\"%s\" of=\"%s\"" \
+        % (self.blocksize, int(middle / 256), int((end - middle) / 256), self.path, temppath)
+    print(cmd)
+    os.system(cmd)
+    cmd = "dd oflag=append conv=notrunc bs=%i skip=%i count=%i if=\"%s\" of=\"%s\"" \
+        % (self.blocksize, int(begin / 256), int((middle - begin) / 256), self.path, temppath)
+    print(cmd)
+    os.system(cmd)
+    cmd = "dd oflag=append conv=notrunc bs=%i skip=%i if=\"%s\" of=\"%s\"" \
+        % (self.blocksize, int(end / 256), self.path, temppath)
+    print(cmd)
+    os.system(cmd)
+
+    self.parmBlock.printDict(ptable)
+    print()
+    for key in ptable:
+      part = ptable[key]
+      if part['offset'] >= begin and part['offset'] < end:
+        part['offset'] += distance
+    ptable["%s:%i" % (vos, vnum)]['offset'] = newOffset
+    self.parmBlock.printDict(ptable)
+    self.parmBlock.setPartitionTable(ptable)
+    os.remove(self.path)
+    shutil.move(temppath, self.path)
+    self.parmBlock.packBlock()
+    self.writeBlock(1, self.parmBlock.block)
+    return
+    
   class ParameterBlock:
     sformat = "< BBB 1s B 19s BHBHHBB 7s 5sH6sH 5sH6sH BB 7s BHH 15s 8s8s8s 6s" \
         " 5sH6sH 5sH6sH BB 1s HHBHHBBHH 77s B"
@@ -220,8 +337,9 @@ class Sider:
       val = ((val & 0xFF) << 8) | ((val & 0xFF00) >> 8)
       return val
     
-    def printDict(self, d):
-      labels = list(d.keys())
+    def printDict(self, d, labels=None):
+      if not labels is not None:
+        labels = list(d.keys())
       col_width = max(len(word) for word in labels) + 2
       for row in labels:
         print((row + ":").ljust(col_width), d[row])
@@ -235,54 +353,68 @@ class Sider:
       self.printDict(d)
       return
 
-    def printPartitions(self):
+    def printPartitions(self, human=True, debugFlag=False):
       d = {}
       tpart = 0
       d['Small DOS'] = self.dict['dosSmallVolumes']
       d['Large DOS'] = self.dict['dosVolumes'] - self.dict['dosSmallVolumes']
+      d['Total DOS'] = d['Small DOS'] + d['Large DOS']
       tpart += d['Small DOS'] * SDOSBYTES
       tpart += d['Large DOS'] * LDOSBYTES
+      labels = ['Small DOS', 'Large DOS', 'Total DOS']
       for i in range(2):
         key = "ProDOS %i" % (i + 1)
         size = self.prodosLength(i)
         tpart += size
-        d[key] = "Size %s" % (sizeof_fmt(size))
+        d[key] = "%s" % (sizeof_fmt(size) if human else size)
+        labels.append(key)
       for i in range(4):
         key = "Pascal %i" % (i + 1)
         size = self.pascalLength(i)
         tpart += size
-        d[key] = "Size %s" % (sizeof_fmt(size))
+        d[key] = "%s" % (sizeof_fmt(size) if human else size)
+        labels.append(key)
       for i in range(4):
         key = "CP/M %i" % (i + 1)
         size = self.cpmLength(i)
         tpart += size
-        d[key] = "Size %s" % (sizeof_fmt(size))
-      d['Sider size'] = sizeof_fmt(self.totalSize())
-      d['Partition size total'] = sizeof_fmt(tpart)
-      self.printDict(d)
-      # print()
-      # d = {}
-      # for i in range(self.dict['dosVolumes']):
-      #   key = "DOS %i" % (i)
-      #   s = self.dosOffset(i)
-      #   e = self.dosLength(i)
-      #   d[key] = "%07x-%07x" % (s, s+e-1)
-      # for i in range(4):
-      #   key = "CP/M %i" % (i)
-      #   s = self.cpmOffset(i)
-      #   e = self.cpmLength(i)
-      #   d[key] = "%07x-%07x" % (s, s+e-1)
-      # for i in range(2):
-      #   key = "ProDOS %i" % (i)
-      #   s = self.prodosOffset(i)
-      #   e = self.prodosLength(i)
-      #   d[key] = "%07x-%07x" % (s, s+e-1)
-      # for i in range(4):
-      #   key = "Pascal %i" % (i)
-      #   s = self.pascalOffset(i)
-      #   e = self.pascalLength(i)
-      #   d[key] = "%07x-%07x" % (s, s+e-1)
-      # self.printDict(d)
+        d[key] = "%s" % (sizeof_fmt(size) if human else size)
+        labels.append(key)
+      size = self.totalSize()
+      d['Partition size total'] = sizeof_fmt(tpart) if human else tpart
+      d['Sider size'] = sizeof_fmt(size) if human else size
+      labels.extend(['Partition size total', 'Sider size'])
+      self.printDict(d, labels)
+
+      if debugFlag:
+        print()
+        d = {}
+        labels = []
+        for i in range(self.dict['dosVolumes']):
+          key = "DOS %i" % (i)
+          s = self.dosOffset(i)
+          e = self.dosLength(i)
+          d[key] = "%07x-%07x" % (s, s+e-1)
+          labels.append(key)
+        for i in range(4):
+          key = "CP/M %i" % (i)
+          s = self.cpmOffset(i)
+          e = self.cpmLength(i)
+          d[key] = "%07x-%07x" % (s, s+e-1)
+          labels.append(key)
+        for i in range(2):
+          key = "ProDOS %i" % (i)
+          s = self.prodosOffset(i)
+          e = self.prodosLength(i)
+          d[key] = "%07x-%07x" % (s, s+e-1)
+          labels.append(key)
+        for i in range(4):
+          key = "Pascal %i" % (i)
+          s = self.pascalOffset(i)
+          e = self.pascalLength(i)
+          d[key] = "%07x-%07x" % (s, s+e-1)
+          labels.append(key)
+        self.printDict(d, labels)
       return
 
     def partitionTable(self):
@@ -344,7 +476,7 @@ class Sider:
       sv = self.dict['dosSmallVolumes']
       tv = self.dict['dosVolumes']
       if vnum < 0 or vnum >= tv:
-        print("Invalid DOS id. Must be from 0 to %i" % (tv - 1))
+        print("Invalid DOS id. Must be from 0 to %i" % (tv - 1), file=sys.stderr)
         return None
       offset = 1024 * 256
       snum = vnum
@@ -359,7 +491,7 @@ class Sider:
       sv = self.dict['dosSmallVolumes']
       tv = self.dict['dosVolumes']
       if vnum < 0 or vnum >= tv:
-        print("Invalid DOS id. Must be from 0 to %i" % (tv - 1))
+        print("Invalid DOS id. Must be from 0 to %i" % (tv - 1), file=sys.stderr)
         return None
       if vnum < sv:
         return SDOSBYTES
@@ -410,20 +542,28 @@ class Sider:
     def setTotalSize(self, val):
       self.dict['cylinders'] = int((val / TRACKBYTES) / self.dict['heads'])
       return
-    
+
+def loadImage(path):
+  with open(path, mode='rb') as f:
+    magic = f.read(4)
+    f.seek(0)
+    if magic == b'2IMG':
+      f.read(64)
+    return f.read()
+
 def main():
   args = build_argparser().parse_args()
 
   if not os.path.exists(args.image):
-    print("No such image \"%s\"" % (args.image))
+    print("No such image \"%s\"" % (args.image), file=sys.stderr)
     exit(1)
     
-  image = Sider(args.image)
+  sider_image = Sider(args.image)
   if args.extract != None:
     if not args.volume:
-      print("Must specify volume to extract")
+      print("Must specify volume to extract", file=sys.stderr)
       exit(1)
-    vol = image.getVolume(args.volume)
+    vol = sider_image.getVolume(args.volume)
     if args.extract:
       path = args.extract
     else:
@@ -434,17 +574,21 @@ def main():
     f.close()
     print("Wrote %i bytes to %s" % (len(vol), path))
   elif args.update != None:
-    with open(args.update, mode='rb') as f:
-      vol = f.read()
-    image.updateVolume(args.volume, vol)
+    img = loadImage(args.update)
+    sider_image.updateVolume(args.volume, img)
     print("Updated %s" % args.volume)
   elif args.resize != None:
-    image.resizeVolume(args.volume, args.resize)
+    sider_image.resizeVolume(args.volume, args.resize)
     print("Resized %s" % args.volume)
+  elif args.move != None:
+    sider_image.moveVolume(args.volume, args.move)
+    print("Moved %s" % args.volume)
   elif args.printblock:
-    print(image.parmBlock.printBlock())
+    sider_image.parmBlock.printBlock()
   else:
-    print(image.parmBlock.printPartitions())
+    sider_image.parmBlock.printPartitions(not args.bytes)
+    size = int((sider_image.parmBlock.totalSize() * sider_image.blocksize) / 256)
+    print("Size on disk:", sizeof_fmt(size) if not args.bytes else size)
   return
 
 if __name__ == '__main__':
