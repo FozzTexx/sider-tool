@@ -20,6 +20,7 @@ import os, sys
 import tempfile
 import shutil
 import math
+import re
 
 TRACKBYTES = 32 * 256
 SDOSBYTES = 140 * 1024
@@ -27,7 +28,7 @@ LDOSBYTES = 400 * 1024
 
 def auto_int(x):
   return int(x, 0)
-            
+
 def build_argparser():
   parser = argparse.ArgumentParser()
   parser.add_argument("image", help="disk image from sider")
@@ -35,7 +36,7 @@ def build_argparser():
                       help="extract a disk partition/volume")
   parser.add_argument("--update",
                       help="update a disk partition/volume with specified disk image")
-  parser.add_argument("--resize", type=int,
+  parser.add_argument("--resize",
                       help="resize a disk partition/volume to the specified byte size")
   parser.add_argument("--move", type=auto_int,
                       help="move a disk partition/volume to the specified offset")
@@ -51,7 +52,23 @@ def sizeof_fmt(num, suffix='B'):
       return "%3.1f%s%s" % (num, unit, suffix)
     num /= 1024.0
   return "%.1f%s%s" % (num, 'Yi', suffix)
-  
+
+def sizeof_unfmt(size, suffix='B'):
+  if isinstance(size, (int, float)):
+    return int(size)
+
+  num = 0
+  val = re.sub("^( *[0-9]+).*", "\\1", size)
+  num = int(val)
+  suffix = size[-1]
+  try:
+    magnitude = ["B", "K", "M", "G"].index(suffix.upper())
+  except ValueError:
+    magnitude = -1
+  if magnitude > 0:
+    num *= math.pow(1024, magnitude)
+  return num
+
 class Sider:
   def __init__(self, path):
     self.path = path
@@ -103,10 +120,10 @@ class Sider:
       print("Unknown partition", file=sys.stderr)
       return False
     return True
-    
+
   def partitionInfo(self, vos, vnum):
     if not self.validVolumeID(vos, vnum):
-      return None
+      return None, None
     if vos == "prodos":
       offset = self.parmBlock.prodosOffset(vnum)
       length = self.parmBlock.prodosLength(vnum)
@@ -131,6 +148,8 @@ class Sider:
     vos = vparms[0].lower()
     vnum = int(vparms[1])
     offset, length = self.partitionInfo(vos, vnum)
+    if offset is None:
+      return None
 
     vol = bytearray()
     offset = int(offset / 256)
@@ -180,9 +199,10 @@ class Sider:
     # partitions are aligned on tracks
     newLength = int((size + TRACKBYTES - 1) / TRACKBYTES) * TRACKBYTES
     newLength = int(newLength / 256)
-    # FIXME - maximum SASI drive size is 128MB. Complain if resize
-    #         will make Sider image too big
-    
+    # FIXME - maximum SASI drive size is 512MB (256 byte
+    #         sectors). Complain if resize will make Sider image too
+    #         big
+
     tempfd, temppath = tempfile.mkstemp(dir=os.path.dirname(self.path))
     os.close(tempfd)
     cmd = "dd if=\"%s\" of=\"%s\" bs=%i count=%i" \
@@ -249,7 +269,6 @@ class Sider:
       print("New offset for volume must land on a partition boundary", file=sys.stderr)
       return False
 
-    # 
     begin = min(offset, newOffset)
     end = max(offset + size, newOffset + size)
     middle = offset
@@ -265,7 +284,7 @@ class Sider:
           "\n  middle:", hex(middle), middle,
           "\n     end:", hex(end), end,
           "\ndistance:", hex(abs(distance)), distance)
-      
+
     tempfd, temppath = tempfile.mkstemp(dir=os.path.dirname(self.path))
     os.close(tempfd)
     cmd = "dd bs=%i count=%i if=\"%s\" of=\"%s\"" \
@@ -299,7 +318,7 @@ class Sider:
     self.parmBlock.packBlock()
     self.writeBlock(1, self.parmBlock.block)
     return
-    
+
   class ParameterBlock:
     sformat = "< BBB 1s B 19s BHBHHBB 7s 5sH6sH 5sH6sH BB 7s BHH 15s 8s8s8s 6s" \
         " 5sH6sH 5sH6sH BB 1s HHBHHBBHH 77s B"
@@ -332,11 +351,11 @@ class Sider:
         values.append(val)
       block = struct.pack(self.sformat, *values)
       self.block = block
-        
+
     def swap16(self, val):
       val = ((val & 0xFF) << 8) | ((val & 0xFF00) >> 8)
       return val
-    
+
     def printDict(self, d, labels=None):
       if not labels is not None:
         labels = list(d.keys())
@@ -344,7 +363,7 @@ class Sider:
       for row in labels:
         print((row + ":").ljust(col_width), d[row])
       return
-      
+
     def printBlock(self):
       d = {}
       for key in self.keys:
@@ -435,7 +454,7 @@ class Sider:
         e = self.pascalLength(i)
         d[key] = {'offset': s, 'length': e}
       return d
-      
+
     def setPartitionTable(self, d):
       for i in range(4):
         key = "cpm:%i" % (i)
@@ -449,7 +468,7 @@ class Sider:
         key = "pascal:%i" % (i)
         self.setPascalOffset(i, d[key]['offset'])
       return d
-      
+
     # ProDOS offset is stored as track number
     def prodosOffset(self, vnum):
       key = "prodos%iStart" % (vnum + 1)
@@ -519,7 +538,7 @@ class Sider:
       key = "cpm%cstart" % (chr(vnum + 65))
       val = self.dict[key] * TRACKBYTES
       return val
-      
+
     def setCPMOffset(self, vnum, val):
       key = "cpm%cstart" % (chr(vnum + 65))
       self.dict[key] = int(val / TRACKBYTES)
@@ -529,7 +548,7 @@ class Sider:
       key = "cpm%csize" % (chr(vnum + 65))
       val = int(self.dict[key] * TRACKBYTES / 4)
       return val
-      
+
     def setCPMLength(self, vnum, val):
       key = "cpm%csize" % (chr(vnum + 65))
       self.dict[key] = int((val * 4) / TRACKBYTES)
@@ -557,13 +576,15 @@ def main():
   if not os.path.exists(args.image):
     print("No such image \"%s\"" % (args.image), file=sys.stderr)
     exit(1)
-    
+
   sider_image = Sider(args.image)
   if args.extract != None:
     if not args.volume:
       print("Must specify volume to extract", file=sys.stderr)
       exit(1)
     vol = sider_image.getVolume(args.volume)
+    if vol is None:
+      exit(1)
     if args.extract:
       path = args.extract
     else:
@@ -578,7 +599,7 @@ def main():
     sider_image.updateVolume(args.volume, img)
     print("Updated %s" % args.volume)
   elif args.resize != None:
-    sider_image.resizeVolume(args.volume, args.resize)
+    sider_image.resizeVolume(args.volume, sizeof_unfmt(args.resize))
     print("Resized %s" % args.volume)
   elif args.move != None:
     sider_image.moveVolume(args.volume, args.move)
@@ -589,6 +610,7 @@ def main():
     sider_image.parmBlock.printPartitions(not args.bytes)
     size = int((sider_image.parmBlock.totalSize() * sider_image.blocksize) / 256)
     print("Size on disk:", sizeof_fmt(size) if not args.bytes else size)
+    print("Sector count:", size // 512)
   return
 
 if __name__ == '__main__':
