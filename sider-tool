@@ -20,11 +20,12 @@ import os, sys
 import tempfile
 import shutil
 import math
-import re
 
 TRACKBYTES = 32 * 256
 SDOSBYTES = 140 * 1024
 LDOSBYTES = 400 * 1024
+
+HUMAN_UNITS = ['','k','M','G','T','P','E','Z']
 
 def auto_int(x):
   return int(x, 0)
@@ -46,28 +47,28 @@ def build_argparser():
   return parser
 
 def sizeof_fmt(num, suffix='B'):
-  for unit in ['','k','M','G','T','P','E','Z']:
+  for unit in HUMAN_UNITS:
     if abs(num) < 1024.0:
       num = math.ceil(num * 10) / 10
       return "%3.1f%s%s" % (num, unit, suffix)
     num /= 1024.0
   return "%.1f%s%s" % (num, 'Yi', suffix)
 
-def sizeof_unfmt(size, suffix='B'):
-  if isinstance(size, (int, float)):
-    return int(size)
-
-  num = 0
-  val = re.sub("^( *[0-9]+).*", "\\1", size)
-  num = int(val)
-  suffix = size[-1]
-  try:
-    magnitude = ["B", "K", "M", "G"].index(suffix.upper())
-  except ValueError:
-    magnitude = -1
-  if magnitude > 0:
-    num *= math.pow(1024, magnitude)
-  return num
+def human_to_int(val):
+  if not isinstance(val, str):
+    return val
+  suffix = val[-1]
+  if suffix in HUMAN_UNITS:
+    val = int(val[:-1])
+    power = 0
+    for idx in range(1, len(HUMAN_UNITS)):
+      power += 1
+      if suffix == HUMAN_UNITS[idx]:
+        break
+    val *= 1024 ** power
+  else:
+    val = int(val)
+  return val
 
 class Sider:
   def __init__(self, path):
@@ -191,6 +192,7 @@ class Sider:
     if vos == "dos":
       print("Cannot resize DOS partitions", file=sys.stderr)
       return False
+
     vnum = int(vparms[1])
     offset, length = self.partitionInfo(vos, vnum)
     offset = int(offset / 256)
@@ -199,10 +201,21 @@ class Sider:
     # partitions are aligned on tracks
     newLength = int((size + TRACKBYTES - 1) / TRACKBYTES) * TRACKBYTES
     newLength = int(newLength / 256)
+
+    partLength = int((size + 255) / 256) * 256
+    maxLength = 32 * 1024 * 1024 - 256
+    if partLength > maxLength:
+      print("Partition size is too large by", size - maxLength, "bytes",
+            file=sys.stderr)
+      return False
+    
     # FIXME - maximum SASI drive size is 512MB (256 byte
     #         sectors). Complain if resize will make Sider image too
     #         big
 
+    # FIXME - if resizing ProDOS partition, fix up ProDOS fields so it
+    #         will still boot
+    
     tempfd, temppath = tempfile.mkstemp(dir=os.path.dirname(self.path))
     os.close(tempfd)
     cmd = "dd if=\"%s\" of=\"%s\" bs=%i count=%i" \
@@ -219,7 +232,7 @@ class Sider:
     os.system(cmd)
     ptable = self.parmBlock.partitionTable()
     # Set actual length to multiple of sector
-    ptable[volid]['length'] = int((size + 255) / 256) * 256
+    ptable[volid]['length'] = partLength
     self.parmBlock.printDict(ptable)
     for key in ptable:
       part = ptable[key]
@@ -599,8 +612,8 @@ def main():
     sider_image.updateVolume(args.volume, img)
     print("Updated %s" % args.volume)
   elif args.resize != None:
-    sider_image.resizeVolume(args.volume, sizeof_unfmt(args.resize))
-    print("Resized %s" % args.volume)
+    if (sider_image.resizeVolume(args.volume, human_to_int(args.resize))):
+      print("Resized %s" % args.volume)
   elif args.move != None:
     sider_image.moveVolume(args.volume, args.move)
     print("Moved %s" % args.volume)
